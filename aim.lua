@@ -47,7 +47,19 @@ fovCircle.Visible     = false
 
 local history = {}
 local HIST_SIZE = 60
+local velSmooth = {}
 
+local function smoothVel(name, vx, vy, vz, alpha)
+    alpha = alpha or 0.35  -- lower = more smoothing
+    if not velSmooth[name] then
+        velSmooth[name] = {vx=vx, vy=vy, vz=vz}
+    end
+    local s = velSmooth[name]
+    s.vx = s.vx + (vx - s.vx) * alpha
+    s.vy = s.vy + (vy - s.vy) * alpha
+    s.vz = s.vz + (vz - s.vz) * alpha
+    return s.vx, s.vy, s.vz
+end
 local function getHist(name)
     if not history[name] then
         history[name] = { buf = {}, head = 0, size = 0 }
@@ -96,18 +108,26 @@ end
 
 -- MROW
 local function predictXYZ(vx, vy, vz, mx, my, mz, yawRate, dt)
+    dt = math.min(dt, 0.165)
+
     local mom_x_dt_sq       = mx * dt * dt
     local mom_y_dt_sq       = my * dt * dt
     local mom_z_dt_cb       = mz * dt * dt * dt
     local yaw_rate_dt       = yawRate * dt
     local yaw_rate_sq_dt_sq = yawRate * yawRate * dt * dt
     local mom_y_vel_y       = my * vy
+
     local corr_x = mom_z_dt_cb * (yawRate / (yaw_rate_sq_dt_sq * yaw_rate_sq_dt_sq + 0.35263535))
     local corr_y = math.max(math.abs(mom_y_dt_sq) - mom_y_vel_y, 0) / -0.26091227
     local corr_z = yaw_rate_dt * (mom_x_dt_sq / (-0.28429636 - yaw_rate_sq_dt_sq))
-    return (vx*dt) + corr_x, (vy*dt) + corr_y, (vz*dt) + corr_z
-end
 
+    local decayRate = 4
+    local decay = (1 - math.exp(-decayRate * dt)) / (decayRate * dt)
+
+    return (vx * dt * decay) + corr_x,
+           (vy * dt * decay) + corr_y,
+           (vz * dt * decay) + corr_z
+end
 local function getAimTime(pixelDist)
     local effectiveSpeed = cfg.sens * 1500 * (1 - cfg.smooth)
     if effectiveSpeed < 50 then effectiveSpeed = 50 end
@@ -119,34 +139,40 @@ local function predictPos(target, extraDt)
     if not target then return nil end
     local char = target.Character
     if not char then return nil end
-    local part = char:FindFirstChild(cfg.part) or char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+    local part = char:FindFirstChild(cfg.part)
+                 or char:FindFirstChild("Head")
+                 or char:FindFirstChild("HumanoidRootPart")
     if not part then return nil end
-
     if not cfg.predict then return part.Position end
 
     local h = getHist(target.Name)
-    local now = pushHist(h, part.Position, part.AssemblyLinearVelocity, part.AssemblyMass)
+
+    pushHist(h, part.Position, part.AssemblyLinearVelocity, part.AssemblyMass)
 
     if h.size < 4 then return part.Position end
 
-    local recent = getRecentData(h)
-    if not recent then return part.Position end
+    local prevIdx = ((h.head - 2) % HIST_SIZE) + 1
+    local prevEntry = h.buf[prevIdx]
+    local yawRate = (h.size >= 2) and prevEntry.yawRate or 0
 
     local dt = cfg.latency + (extraDt or 0)
     if dt < 0.001 then return part.Position end
 
     local curPos = part.Position
     local curVel = part.AssemblyLinearVelocity
-    local mass = part.AssemblyMass or 1
+    local mass   = part.AssemblyMass or 1
     if mass <= 0 then mass = 1 end
 
-    local vx, vy, vz = predictXYZ(
-        curVel.X, curVel.Y, curVel.Z,
-        curVel.X * mass, curVel.Y * mass, curVel.Z * mass,
-        recent.yawRate, dt
+    local svx, svy, svz = smoothVel(target.Name,
+        curVel.X, curVel.Y, curVel.Z)
+
+    local dx, dy, dz = predictXYZ(
+        svx, svy, svz,
+        svx * mass, svy * mass, svz * mass,
+        yawRate, dt
     )
 
-    return Vector3.new(curPos.X + vx, curPos.Y + vy, curPos.Z + vz)
+    return Vector3.new(curPos.X + dx, curPos.Y + dy, curPos.Z + dz)
 end
 
 local function w2s(pos)
